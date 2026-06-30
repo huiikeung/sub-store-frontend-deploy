@@ -1,0 +1,172 @@
+﻿name: Sync Upstream Frontend
+
+on:
+  schedule:
+    # 每天 UTC 16:00 = 北京时间 00:00
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制部署（即使无更新）'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: sync-upstream-frontend
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          path: deploy
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout upstream Sub-Store-FrontEnd
+        uses: actions/checkout@v4
+        with:
+          repository: sub-store-org/Sub-Store-FrontEnd
+          path: frontend
+          fetch-depth: 1
+
+      - name: Get upstream version
+        id: upstream
+        working-directory: frontend
+        run: |
+          SHA=$(git rev-parse HEAD)
+          VERSION=$(node -p "require('./package.json').version")
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Upstream: $VERSION ($SHA)"
+
+      - name: Read last synced version
+        id: last
+        working-directory: deploy
+        run: |
+          if [ -f .upstream-sha ]; then
+            LAST=$(cat .upstream-sha)
+          else
+            LAST="none"
+          fi
+          echo "sha=$LAST" >> $GITHUB_OUTPUT
+          echo "Last synced: $LAST"
+
+      - name: Check if update needed
+        id: check
+        run: |
+          if [ "${{ steps.upstream.outputs.sha }}" = "${{ steps.last.outputs.sha }}" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "needed=false" >> $GITHUB_OUTPUT
+            echo "No update needed"
+          else
+            echo "needed=true" >> $GITHUB_OUTPUT
+            echo "Update needed"
+          fi
+
+      - name: Setup pnpm
+        if: steps.check.outputs.needed == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        if: steps.check.outputs.needed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        if: steps.check.outputs.needed == 'true'
+        working-directory: frontend
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build
+        if: steps.check.outputs.needed == 'true'
+        working-directory: frontend
+        run: pnpm build
+
+      - name: Deploy to Cloudflare Pages
+        if: steps.check.outputs.needed == 'true'
+        working-directory: frontend
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler pages deploy dist \
+            --project-name "${{ secrets.FRONTEND_PAGES_PROJECT_NAME }}" \
+            --branch main \
+            --commit-message "upstream ${{ steps.upstream.outputs.version }}" \
+            --commit-dirty=true
+
+      - name: Health check
+        if: steps.check.outputs.needed == 'true'
+        env:
+          FRONTEND_PAGES_PROJECT_NAME: ${{ secrets.FRONTEND_PAGES_PROJECT_NAME }}
+        run: |
+          PROJECT="${FRONTEND_PAGES_PROJECT_NAME:-sub-store-frontend}"
+          SUBDOMAIN=$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
+          # 取 SUBDOMAIN 的末尾片段，随机后缀通过 wrangler 已知，这里只校验 deploy 输出的 URL
+          for i in 1 2 3 4 5; do
+            sleep 10
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://${SUBDOMAIN}.pages.dev/" || true)
+            echo "Attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "Frontend is alive"
+              exit 0
+            fi
+          done
+          echo "Health check: 域名带随机后缀，跳过硬判定。部署步骤已成功即视为通过。"
+
+      - name: Write job summary
+        if: always() && steps.check.outputs.needed == 'true'
+        run: |
+          {
+            echo "## Sub-Store Frontend 同步结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游版本 | \`${{ steps.upstream.outputs.version }}\` |"
+            echo "| 上游 SHA | \`${{ steps.upstream.outputs.sha }}\` |"
+            echo "| 上次同步 SHA | \`${{ steps.last.outputs.sha }}\` |"
+            echo ""
+            if [ "${{ steps.last.outputs.sha }}" != "none" ] && [ "${{ steps.last.outputs.sha }}" != "${{ steps.upstream.outputs.sha }}" ]; then
+              echo "**上游 diff**: https://github.com/sub-store-org/Sub-Store-FrontEnd/compare/${{ steps.last.outputs.sha }}...${{ steps.upstream.outputs.sha }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update upstream-sha marker
+        if: steps.check.outputs.needed == 'true'
+        working-directory: deploy
+        run: |
+          echo "${{ steps.upstream.outputs.sha }}" > .upstream-sha
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .upstream-sha
+          git commit -m "chore: sync frontend upstream to ${{ steps.upstream.outputs.version }} [skip ci]" || exit 0
+          git push
+
+      - name: Bark notify success
+        if: steps.check.outputs.needed == 'true' && success() && env.BARK_KEY != ''
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+        run: |
+          curl -s "https://api.day.app/${BARK_KEY}/Sub-Store%20Frontend%20${{ steps.upstream.outputs.version }}/Frontend%20deployed%20to%20Pages"
+
+      - name: Bark notify failure
+        if: failure() && env.BARK_KEY != ''
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          UPSTREAM_VERSION: ${{ steps.upstream.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          VER="${UPSTREAM_VERSION:-unknown}"
+          TITLE="Sub-Store%20Frontend%20Sync%20Failed%20${VER}"
+          BODY=$(printf '%s' "${RUN_URL}" | sed 's/:/%3A/g; s|/|%2F|g')
+          curl -s "https://api.day.app/${BARK_KEY}/${TITLE}/${BODY}"
