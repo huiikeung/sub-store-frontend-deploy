@@ -1,4 +1,4 @@
-﻿name: Sync Upstream Frontend
+name: Sync Upstream Frontend
 
 on:
   schedule:
